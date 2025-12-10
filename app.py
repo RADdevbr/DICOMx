@@ -3,71 +3,136 @@ import streamlit as st
 import numpy as np
 import pydicom
 import matplotlib.pyplot as plt
+from sqlalchemy import create_engine, Column, String, Integer, ForeignKey
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
-st.title("Visualizador DICOM simples em Streamlit")
+# Configuração do banco SQLite
+engine = create_engine("sqlite:///dicom.db")
+Base = declarative_base()
+Session = sessionmaker(bind=engine)
+session = Session()
 
-# Upload de múltiplos arquivos DICOM
-files = st.file_uploader("Selecione arquivos DICOM da série", type=["dcm"], accept_multiple_files=True)
+# Definição das tabelas
+class Patient(Base):
+    __tablename__ = "patient"
+    patient_id = Column(String, primary_key=True)
+    name = Column(String)
+    sex = Column(String)
+    birth_date = Column(String)
+    studies = relationship("Study", back_populates="patient")
+
+class Study(Base):
+    __tablename__ = "study"
+    study_uid = Column(String, primary_key=True)
+    patient_id = Column(String, ForeignKey("patient.patient_id"))
+    description = Column(String)
+    date = Column(String)
+    patient = relationship("Patient", back_populates="studies")
+    series = relationship("Series", back_populates="study")
+
+class Series(Base):
+    __tablename__ = "series"
+    series_uid = Column(String, primary_key=True)
+    study_uid = Column(String, ForeignKey("study.study_uid"))
+    description = Column(String)
+    modality = Column(String)
+    study = relationship("Study", back_populates="series")
+    images = relationship("Image", back_populates="series")
+
+class Image(Base):
+    __tablename__ = "image"
+    sop_uid = Column(String, primary_key=True)
+    series_uid = Column(String, ForeignKey("series.series_uid"))
+    instance_number = Column(Integer)
+    path = Column(String)
+    series = relationship("Series", back_populates="images")
+
+Base.metadata.create_all(engine)
+
+# Função de window/level
+def apply_wl(img, window, level):
+    low, high = level - window/2, level + window/2
+    img = np.clip(img, low, high)
+    img = (img - low) / (high - low)
+    return img
+
+# Upload de arquivos
+st.title("Mini PACS + Visualizador DICOM")
+files = st.file_uploader("Selecione arquivos DICOM", type=["dcm"], accept_multiple_files=True)
 
 if files:
-    # Ler todos os datasets
-    datasets = [pydicom.dcmread(f, force=True) for f in files]
+    for f in files:
+        ds = pydicom.dcmread(f, force=True)
+        # Inserir paciente
+        patient = session.get(Patient, ds.PatientID) or Patient(
+            patient_id=ds.PatientID,
+            name=str(getattr(ds, "PatientName", "")),
+            sex=getattr(ds, "PatientSex", ""),
+            birth_date=getattr(ds, "PatientBirthDate", "")
+        )
+        session.add(patient)
 
-    # Ordenar pela posição da fatia (se disponível)
-    def slice_position(ds):
-        try:
-            return float(ds.ImagePositionPatient[2])
-        except Exception:
-            return float(ds.InstanceNumber)
-    datasets.sort(key=slice_position)
+        # Inserir estudo
+        study = session.get(Study, ds.StudyInstanceUID) or Study(
+            study_uid=ds.StudyInstanceUID,
+            patient=patient,
+            description=getattr(ds, "StudyDescription", ""),
+            date=getattr(ds, "StudyDate", "")
+        )
+        session.add(study)
 
-    # Montar volume numpy (Z, Y, X)
-    slope = float(getattr(datasets[0], "RescaleSlope", 1.0))
-    intercept = float(getattr(datasets[0], "RescaleIntercept", 0.0))
-    vol = np.stack([ds.pixel_array.astype(np.float32) * slope + intercept for ds in datasets], axis=0)
+        # Inserir série
+        series = session.get(Series, ds.SeriesInstanceUID) or Series(
+            series_uid=ds.SeriesInstanceUID,
+            study=study,
+            description=getattr(ds, "SeriesDescription", ""),
+            modality=getattr(ds, "Modality", "")
+        )
+        session.add(series)
 
-    st.write(f"Volume carregado: {vol.shape}")
+        # Inserir imagem
+        image = Image(
+            sop_uid=ds.SOPInstanceUID,
+            series=series,
+            instance_number=int(getattr(ds, "InstanceNumber", 0)),
+            path=f.name
+        )
+        session.add(image)
 
-    # Controles
-    axis = st.selectbox("Plano", ["Axial (Z)", "Coronal (Y)", "Sagital (X)"])
-    index = st.slider("Índice da fatia", 0, vol.shape[0]-1, vol.shape[0]//2)
-    window = st.slider("Window", 1, 4000, 400)
-    level = st.slider("Level", -1000, 1000, 40)
+    session.commit()
+    st.success("Exames importados para o banco SQLite!")
 
-    # Função de window/level
-    def apply_wl(img, window, level):
-        low, high = level - window/2, level + window/2
-        img = np.clip(img, low, high)
-        img = (img - low) / (high - low)
-        return img
+# Browser de pacientes
+patients = session.query(Patient).all()
+for p in patients:
+    with st.expander(f"Paciente: {p.name} ({p.patient_id})"):
+        for s in p.studies:
+            st.write(f"Estudo: {s.description} - {s.date}")
+            for se in s.series:
+                st.write(f"  Série: {se.description} ({se.modality})")
+                if st.button(f"Visualizar série {se.series_uid}"):
+                    # Carregar imagens da série
+                    imgs = [pydicom.dcmread(img.path).pixel_array for img in se.images]
+                    vol = np.stack(imgs, axis=0)
 
-    # Selecionar fatia
-    if axis.startswith("Axial"):
-        img = vol[index,:,:]
-    elif axis.startswith("Coronal"):
-        img = vol[:,index,:]
-    else:  # Sagital
-        img = vol[:,:,index]
+                    # Controles interativos
+                    axis = st.selectbox("Plano", ["Axial (Z)", "Coronal (Y)", "Sagital (X)"])
+                    window = st.slider("Window", 1, 4000, 400)
+                    level = st.slider("Level", -1000, 1000, 40)
 
-    img_wl = apply_wl(img, window, level)
+                    if axis.startswith("Axial"):
+                        idx = st.slider("Corte axial (Z)", 0, vol.shape[0]-1, vol.shape[0]//2)
+                        img = vol[idx,:,:]
+                    elif axis.startswith("Coronal"):
+                        idx = st.slider("Corte coronal (Y)", 0, vol.shape[1]-1, vol.shape[1]//2)
+                        img = vol[:,idx,:]
+                    else:
+                        idx = st.slider("Corte sagital (X)", 0, vol.shape[2]-1, vol.shape[2]//2)
+                        img = vol[:,:,idx]
 
-    # Mostrar imagem
-    fig, ax = plt.subplots()
-    ax.imshow(img_wl, cmap="gray")
-    ax.axis("off")
-    st.pyplot(fig)
+                    img_wl = apply_wl(img, window, level)
 
-    # Projeções MIP/MinIP
-    if st.checkbox("Mostrar projeção (MIP/MinIP)"):
-        mode = st.selectbox("Modo", ["MIP", "MinIP"])
-        if axis.startswith("Axial"):
-            proj = vol.max(axis=0) if mode=="MIP" else vol.min(axis=0)
-        elif axis.startswith("Coronal"):
-            proj = vol.max(axis=1) if mode=="MIP" else vol.min(axis=1)
-        else:
-            proj = vol.max(axis=2) if mode=="MIP" else vol.min(axis=2)
-        proj_wl = apply_wl(proj, window, level)
-        fig2, ax2 = plt.subplots()
-        ax2.imshow(proj_wl, cmap="gray")
-        ax2.axis("off")
-        st.pyplot(fig2)
+                    fig, ax = plt.subplots()
+                    ax.imshow(img_wl, cmap="gray")
+                    ax.axis("off")
+                    st.pyplot(fig)
