@@ -1,5 +1,5 @@
-streamlit
-pydicom
-gdcm
-vtk
-numpy
+streamlit==1.52.1
+pydicom==2.4.4
+numpy==1.26.4
+matplotlib==3.9.2
+plotly==5.24.1
